@@ -158,6 +158,43 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         bsq_loss, quantized, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
         return z_indices
 
+    def encode_embeddings(self, x, pooling='last'):
+        """
+        Extract continuous embeddings BEFORE quantization.
+
+        This method returns the encoder output (continuous vectors) instead of
+        discrete tokens, which is useful for using Kronos as a feature extractor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_in).
+            pooling (str): How to aggregate sequence into single vector:
+                - 'last': Take last timestep (default)
+                - 'mean': Average across sequence
+                - 'max': Max pooling across sequence
+                - 'none': Return full sequence (batch, seq_len, codebook_dim)
+
+        Returns:
+            torch.Tensor: Continuous embeddings
+                - If pooling != 'none': (batch_size, codebook_dim)
+                - If pooling == 'none': (batch_size, seq_len, codebook_dim)
+        """
+        z = self.embed(x)  # (B, T, d_model)
+        for layer in self.encoder:
+            z = layer(z)  # (B, T, d_model)
+        z = self.quant_embed(z)  # (B, T, codebook_dim) - continuous embeddings before quantization
+
+        # Pooling across sequence dimension
+        if pooling == 'last':
+            return z[:, -1, :]  # (B, codebook_dim)
+        elif pooling == 'mean':
+            return z.mean(dim=1)  # (B, codebook_dim)
+        elif pooling == 'max':
+            return z.max(dim=1)[0]  # (B, codebook_dim)
+        elif pooling == 'none':
+            return z  # (B, T, codebook_dim)
+        else:
+            raise ValueError(f"Unknown pooling method: {pooling}")
+
     def decode(self, x, half=False):
         """
         Decodes quantized indices back to the input data space.
