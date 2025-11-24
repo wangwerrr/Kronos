@@ -158,40 +158,58 @@ class KronosTokenizer(nn.Module, PyTorchModelHubMixin):
         bsq_loss, quantized, z_indices = self.tokenizer(z, half=half, collect_metrics=False)
         return z_indices
 
-    def encode_embeddings(self, x, pooling='last'):
+    def encode_embeddings(self, x, pooling='last', use_transformer=True, target_dim=None):
         """
-        Extract continuous embeddings BEFORE quantization.
+        Extract continuous embeddings from encoder transformer.
 
-        This method returns the encoder output (continuous vectors) instead of
-        discrete tokens, which is useful for using Kronos as a feature extractor.
+        This method returns the encoder output (continuous vectors) with full temporal information
+        from transformer layers, useful for using Kronos as a feature extractor.
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len, d_in).
             pooling (str): How to aggregate sequence into single vector:
-                - 'last': Take last timestep (default)
+                - 'last': Take last timestep (default) - recommended for temporal modeling
                 - 'mean': Average across sequence
                 - 'max': Max pooling across sequence
-                - 'none': Return full sequence (batch, seq_len, codebook_dim)
+                - 'none': Return full sequence (batch, seq_len, d_model or target_dim)
+            use_transformer (bool): If True, extract from transformer layers (d_model dim, with temporal info).
+                                   If False, extract from quant_embed (codebook_dim, without full temporal context).
+                                   Default: True (recommended for better temporal representation)
+            target_dim (int, optional): If specified, project embeddings to this dimension.
+                                       If None, returns d_model (use_transformer=True) or codebook_dim (use_transformer=False).
 
         Returns:
             torch.Tensor: Continuous embeddings
-                - If pooling != 'none': (batch_size, codebook_dim)
-                - If pooling == 'none': (batch_size, seq_len, codebook_dim)
+                - If pooling != 'none': (batch_size, target_dim or d_model/codebook_dim)
+                - If pooling == 'none': (batch_size, seq_len, target_dim or d_model/codebook_dim)
         """
         z = self.embed(x)  # (B, T, d_model)
+
+        # Pass through encoder transformer layers
         for layer in self.encoder:
-            z = layer(z)  # (B, T, d_model)
-        z = self.quant_embed(z)  # (B, T, codebook_dim) - continuous embeddings before quantization
+            z = layer(z)  # (B, T, d_model) - includes full temporal context
+
+        if not use_transformer:
+            # Legacy mode: use quant_embed projection (loses some temporal info)
+            z = self.quant_embed(z)  # (B, T, codebook_dim)
+
+        # Apply target dimension projection if specified
+        if target_dim is not None:
+            if not hasattr(self, 'projection_layer') or self.projection_layer is None:
+                # Dynamically create projection layer
+                input_dim = z.shape[-1]
+                self.projection_layer = nn.Linear(input_dim, target_dim).to(z.device)
+            z = self.projection_layer(z)  # (B, T, target_dim)
 
         # Pooling across sequence dimension
         if pooling == 'last':
-            return z[:, -1, :]  # (B, codebook_dim)
+            return z[:, -1, :]  # (B, target_dim or d_model/codebook_dim) - last token
         elif pooling == 'mean':
-            return z.mean(dim=1)  # (B, codebook_dim)
+            return z.mean(dim=1)  # (B, target_dim or d_model/codebook_dim) - mean pooling
         elif pooling == 'max':
-            return z.max(dim=1)[0]  # (B, codebook_dim)
+            return z.max(dim=1)[0]  # (B, target_dim or d_model/codebook_dim) - max pooling
         elif pooling == 'none':
-            return z  # (B, T, codebook_dim)
+            return z  # (B, T, target_dim or d_model/codebook_dim) - full sequence
         else:
             raise ValueError(f"Unknown pooling method: {pooling}")
 
